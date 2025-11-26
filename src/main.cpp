@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cmath>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 
 #include "bigint.h"
@@ -46,6 +47,8 @@ int print_process(mqd_t out_mq);
 void cleanup_resources(SharedData* data, int shm_fd, sem_t* sem, mqd_t mq,
                        mqd_t out_mq);
 int is_prime(int n);
+
+void terminate_processes(pid_t pid_primes, pid_t pid_odd, pid_t pid_even);
 
 static int g_shm_fd = -1;
 static SharedData* g_data = (SharedData*)MAP_FAILED;
@@ -220,17 +223,44 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  int status;
-  waitpid(pid_primes, &status, 0);
-  waitpid(pid_odd, &status, 0);
-  waitpid(pid_even, &status, 0);
+  pid_t pids[] = {pid_primes, pid_odd, pid_even};
+  int remaining = 3;
+  int exit = 0;
+
+  while (remaining > 0) {
+    for (int i = 0; i < 3; ++i) {
+      if (pids[i] <= 0) {
+        continue;
+      }
+
+      int status;
+      pid_t ret = waitpid(pids[i], &status, WNOHANG);
+      if (ret > 0) {
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+          if (WEXITSTATUS(status) != 0) {
+            terminate_processes(pids[0], pids[1], pids[2]);
+            exit = 1;
+            break;
+          }
+        }
+        pids[i] = -1;
+        remaining--;
+      }
+    }
+    if (exit) {
+      break;
+    }
+    usleep(1000);
+  }
+
   if (print) {
     kill(pid_print, SIGINT);
+    int status;
     waitpid(pid_print, &status, 0);
   }
 
   cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
-  return 0;
+  return exit;
 }
 
 void cleanup_resources(SharedData* data, int shm_fd, sem_t* sem, mqd_t mq,
@@ -453,4 +483,16 @@ int print_process(mqd_t out_mq) {
 
   printf(C_YELLOW "[PRINT]" C_RESET " finished.\n");
   return 0;
+}
+
+void terminate_processes(pid_t pid_primes, pid_t pid_odd, pid_t pid_even) {
+  int status;
+  printf("Fatal error occured. Terminating program...\n");
+
+  pid_t pids[] = {pid_primes, pid_odd, pid_even};
+  for (int i = 0; i < 3; ++i) {
+    if (pids[i] > 0) {
+      kill(pids[i], SIGINT);
+    }
+  }
 }
