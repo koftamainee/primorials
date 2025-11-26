@@ -1,5 +1,6 @@
 #include <climits>
 #include <cmath>
+#include <cstring>
 #include <ostream>
 #include <stack>
 #include <stdexcept>
@@ -59,4 +60,15 @@ std::istream& operator>>(std::istream& in, bigint& num) {
   }
 
   return in;
+}
+
+size_t bigint::to_array(int* to_write, size_t max_size) const {
+  size_t n = size();
+  if (max_size < n) {
+    return 0;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    to_write[i] = operator[](i);
+  }
+  return n;
 }

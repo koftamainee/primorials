@@ -123,6 +123,8 @@ class bigint final {
                                   bigint const& num) noexcept;
   friend std::istream& operator>>(std::istream& in, bigint& num);
 
+  size_t to_array(int* to_write, size_t max_size) const;
+
  private:
   // Constants
   static constexpr unsigned int SHIFT = (sizeof(int) << 2);

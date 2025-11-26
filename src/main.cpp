@@ -12,9 +12,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cmath>
+#include <csignal>
 #include <iostream>
-#include <string>
 
 #include "bigint.h"
 #include "colors.h"
@@ -22,8 +23,10 @@
 #define SHM_NAME "/primes_shm"
 #define SEM_NAME "/primes_sem"
 #define MQ_NAME "/primorial_mq"
+#define OUTMQ_NAME "/out_primorial_mq"
 
-#define MSG_LEN 4096
+#define LIMBS_MAX_COUNT 1024
+#define MSG_LEN ((LIMBS_MAX_COUNT + 1) * sizeof(int))
 
 #define INVALID_ARGUMENTS (-1)
 #define FAILED_RECEIVE_MESSAGE (-2)
@@ -38,19 +41,30 @@ struct SharedData {
 
 int primes_process(int upto, SharedData* data, sem_t* sem);
 int proc_process(int upto, int start_i, int step, SharedData* data, sem_t* sem,
-                 mqd_t mq);
-void cleanup_resources(SharedData* data, int shm_fd, sem_t* sem, mqd_t mq);
+                 mqd_t mq, mqd_t out_mq, int print);
+int print_process(mqd_t out_mq);
+void cleanup_resources(SharedData* data, int shm_fd, sem_t* sem, mqd_t mq,
+                       mqd_t out_mq);
 int is_prime(int n);
 
 static int g_shm_fd = -1;
 static SharedData* g_data = (SharedData*)MAP_FAILED;
 static sem_t* g_sem = SEM_FAILED;
 static mqd_t g_mq = (mqd_t)-1;
+static mqd_t g_out_mq = (mqd_t)-1;
+
+volatile sig_atomic_t print_stop_requested = 0;
+
+void print_sigint_handler(int) { print_stop_requested = 1; }
 
 void sigint_handler(int) {
   if (g_mq != (mqd_t)-1) {
     mq_close(g_mq);
     mq_unlink(MQ_NAME);
+  }
+  if (g_out_mq != (mqd_t)-1) {
+    mq_close(g_out_mq);
+    mq_unlink(OUTMQ_NAME);
   }
   if (g_sem != SEM_FAILED) {
     sem_close(g_sem);
@@ -67,9 +81,14 @@ void sigint_handler(int) {
 }
 
 int main(int argc, char* argv[]) {
-  if (argc != 2) {
+  if (argc < 2) {
     fprintf(stderr, "Usage: %s <upto>\n", argv[0]);
     return INVALID_ARGUMENTS;
+  }
+  int print = 0;
+
+  if (argc == 3 && strcmp(argv[2], "--print") == 0) {
+    print = 1;
   }
 
   int upto = atoi(argv[1]);
@@ -134,21 +153,34 @@ int main(int argc, char* argv[]) {
   g_mq = mq_open(MQ_NAME, O_CREAT | O_RDWR, 0666, &attr);
   if (g_mq == (mqd_t)-1) {
     perror("mq_open");
-    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq);
+    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
     return EXIT_FAILURE;
   }
 
-  const char* init = "1";
-  if (mq_send(g_mq, init, strlen(init) + 1, 0) == -1) {
+  attr.mq_flags = O_NONBLOCK;
+
+  if (print) {
+    g_out_mq = mq_open(OUTMQ_NAME, O_CREAT | O_RDWR | O_NONBLOCK, 0666, &attr);
+    if (g_mq == (mqd_t)-1) {
+      perror("mq_open");
+      cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
+      return EXIT_FAILURE;
+    }
+  }
+
+  int init_buf[2];
+  init_buf[0] = 1;
+  init_buf[1] = 1;
+  if (mq_send(g_mq, (char*)init_buf, 2 * sizeof(int), 0) == -1) {
     perror("mq_send initial");
-    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq);
+    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
     return EXIT_FAILURE;
   }
 
   pid_t pid_primes = fork();
   if (pid_primes < 0) {
     perror("fork primes");
-    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq);
+    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
     return EXIT_FAILURE;
   }
   if (pid_primes == 0) {
@@ -158,36 +190,58 @@ int main(int argc, char* argv[]) {
   pid_t pid_odd = fork();
   if (pid_odd < 0) {
     perror("fork proc odd");
-    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq);
+    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
     return EXIT_FAILURE;
   }
   if (pid_odd == 0) {
-    return proc_process(upto, 1, 2, g_data, g_sem, g_mq);
+    return proc_process(upto, 1, 2, g_data, g_sem, g_mq, g_out_mq, print);
   }
 
   pid_t pid_even = fork();
   if (pid_even < 0) {
     perror("fork proc even");
-    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq);
+    cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
     return EXIT_FAILURE;
   }
   if (pid_even == 0) {
-    return proc_process(upto, 2, 2, g_data, g_sem, g_mq);
+    return proc_process(upto, 2, 2, g_data, g_sem, g_mq, g_out_mq, print);
+  }
+
+  pid_t pid_print = -1;
+  if (print) {
+    pid_print = fork();
+    if (pid_print < 0) {
+      perror("fork print");
+      cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
+      return EXIT_FAILURE;
+    }
+    if (pid_print == 0) {
+      return print_process(g_out_mq);
+    }
   }
 
   int status;
   waitpid(pid_primes, &status, 0);
   waitpid(pid_odd, &status, 0);
   waitpid(pid_even, &status, 0);
+  if (print) {
+    kill(pid_print, SIGINT);
+    waitpid(pid_print, &status, 0);
+  }
 
-  cleanup_resources(g_data, g_shm_fd, g_sem, g_mq);
+  cleanup_resources(g_data, g_shm_fd, g_sem, g_mq, g_out_mq);
   return 0;
 }
 
-void cleanup_resources(SharedData* data, int shm_fd, sem_t* sem, mqd_t mq) {
+void cleanup_resources(SharedData* data, int shm_fd, sem_t* sem, mqd_t mq,
+                       mqd_t out_mq) {
   if (mq != (mqd_t)-1) {
     mq_close(mq);
     mq_unlink(MQ_NAME);
+  }
+  if (out_mq != (mqd_t)-1) {
+    mq_close(out_mq);
+    mq_unlink(OUTMQ_NAME);
   }
   if (sem != SEM_FAILED) {
     sem_close(sem);
@@ -260,7 +314,7 @@ int primes_process(int upto, SharedData* data, sem_t* sem) {
 }
 
 int proc_process(int upto, int start_i, int step, SharedData* data, sem_t* sem,
-                 mqd_t mq) {
+                 mqd_t mq, mqd_t out_mq, int print) {
   if (step != 2 || !data || sem == SEM_FAILED || mq == (mqd_t)-1) {
     fprintf(stderr, "[PROC] invalid args\n");
     return INVALID_ARGUMENTS;
@@ -274,8 +328,9 @@ int proc_process(int upto, int start_i, int step, SharedData* data, sem_t* sem,
                                     : C_MAGENTA "[PROC_2i]" C_RESET;
   std::cout << name << " started\n";
 
-  char buf[MSG_LEN];
+  int buf[LIMBS_MAX_COUNT + 1];
   int current_primorial = start_i;
+  bigint primorial;
 
   for (int i = start_i - 1; i < upto; i += 2) {
     while (true) {
@@ -290,41 +345,50 @@ int proc_process(int upto, int start_i, int step, SharedData* data, sem_t* sem,
         continue;
       }
 
-      ssize_t read_bytes = mq_receive(mq, buf, MSG_LEN, NULL);
+      ssize_t read_bytes = mq_receive(mq, (char*)buf, MSG_LEN, NULL);
       if (read_bytes == -1) {
         perror("mq_receive");
         sem_post(sem);
         return FAILED_RECEIVE_MESSAGE;
       }
-      if (read_bytes >= MSG_LEN)
-        buf[MSG_LEN - 1] = '\0';
-      else
-        buf[read_bytes] = '\0';
 
       try {
-        bigint primorial(buf);
+        primorial = bigint(buf + 1, buf[0]);
         primorial *= data->prime;
 
-        std::string out = primorial.to_string();
-        if (out.size() + 1 > (size_t)MSG_LEN) {
-          fprintf(stderr, "%s primorial too large for mq (len=%zu)\n", name,
-                  out.size());
+        buf[0] = primorial.to_array(buf + 1, sizeof(buf));
+        if (buf[0] == 0) {
+          fprintf(stderr, "%s primorial too large for mq\n", name);
           sem_post(sem);
           return FAILED_SEND_MESSAGE;
         }
 
-        if (mq_send(mq, out.c_str(), out.size() + 1, 0) == -1) {
+        if (mq_send(mq, (char*)buf, (buf[0] + 1) * sizeof(int), 0) == -1) {
           perror("mq_send");
           sem_post(sem);
           return FAILED_SEND_MESSAGE;
+        }
+
+        while (print) {
+          if (mq_send(out_mq, (char*)buf, (buf[0] + 1) * sizeof(int), 0) ==
+              -1) {
+            if (errno == EAGAIN) {
+              usleep(1000);
+              continue;
+            } else {
+              perror("mq_send");
+              sem_post(sem);
+              return FAILED_SEND_MESSAGE;
+            }
+          }
+          break;
         }
 
         data->has_new = 0;
         data->turn = 0;
         sem_post(sem);
 
-        std::cout << name << " multiplied by " << data->prime << " -> " << out
-                  << ": [" << current_primorial << "#]\n";
+        std::cout << name << " multiplied by " << data->prime << "\n";
         current_primorial += 2;
 
       } catch (const std::exception& e) {
@@ -337,6 +401,11 @@ int proc_process(int upto, int start_i, int step, SharedData* data, sem_t* sem,
     }
   }
 
+  if (!print) {
+    std::cout << name << "Final primorial: " << current_primorial - 2
+              << "# = " << primorial << "\n";
+  }
+
   std::cout << name << " finished\n";
   return 0;
 }
@@ -347,4 +416,41 @@ int is_prime(int n) {
   for (int i = 2; i <= r; ++i)
     if (n % i == 0) return 0;
   return 1;
+}
+
+int print_process(mqd_t out_mq) {
+  printf(C_YELLOW "[PRINT]" C_RESET " started.\n");
+
+  int buf[LIMBS_MAX_COUNT + 1];
+  ssize_t read_bytes;
+  size_t primorial_num = 1;
+
+  struct sigaction sa{};
+  sa.sa_handler = print_sigint_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, nullptr);
+
+  while (1) {
+    read_bytes = mq_receive(out_mq, (char*)buf, MSG_LEN * sizeof(int), nullptr);
+    if (read_bytes == -1) {
+      if (errno == EAGAIN) {
+        if (print_stop_requested) {
+          break;
+        }
+        usleep(1000);
+        continue;
+      } else {
+        perror("mq_receive");
+        return FAILED_RECEIVE_MESSAGE;
+      }
+    }
+
+    bigint primorial(buf + 1, buf[0]);
+    std::cout << C_YELLOW << "[PRINT]" << C_RESET << ": " << primorial_num++
+              << "# = " << primorial << "\n";
+  }
+
+  printf(C_YELLOW "[PRINT]" C_RESET " finished.\n");
+  return 0;
 }
